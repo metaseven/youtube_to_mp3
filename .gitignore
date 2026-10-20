@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+
+# Environment & Secrets
+.env
+cookies.txt
+
+# Temporary downloads
+downloads/
+tmp/
+
+# IDE & OS
+.DS_Store
+.idea/
+.vscode/
+*.log
