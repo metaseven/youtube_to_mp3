@@ -105,3 +105,13 @@ def format_duration(seconds: int | float | None) -> str:
     if hours > 0:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def render_progress_bar(percent: float, width: int = 12) -> str:
+    """Формирует текстовый прогресс-бар вида [██████░░░░░░] 50%."""
+    clamped = max(0.0, min(100.0, percent))
+    filled = int(round((clamped / 100.0) * width))
+    empty = width - filled
+    bar = "█" * filled + "░" * empty
+    return f"[{bar}] {clamped:.0f}%"
+

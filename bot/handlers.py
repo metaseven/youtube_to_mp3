@@ -1,10 +1,13 @@
 import asyncio
 import html
 import logging
+import time
+from typing import Any, Callable, Coroutine
 import uuid
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatAction, ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -15,10 +18,43 @@ from aiogram.types import (
 )
 
 from bot.config import Config
-from bot.downloader import DownloadError, MediaSourceInfo, VideoItem, YouTubeDownloader
-from bot.utils import extract_youtube_urls, format_duration, has_playlist_param, is_playlist_url
+from bot.downloader import DownloadError, MediaSourceInfo, ProgressState, VideoItem, YouTubeDownloader
+from bot.utils import (
+    extract_youtube_urls,
+    format_duration,
+    has_playlist_param,
+    is_playlist_url,
+    render_progress_bar,
+)
 
 logger = logging.getLogger(__name__)
+
+
+async def _retry_telegram_call(
+    coro_factory: Callable[[], Coroutine[Any, Any, Any]],
+    max_retries: int = 3,
+) -> Any:
+    """Выполняет запрос к Telegram API с автоматическим повтором при таймаутах и лимитах."""
+    for attempt in range(max_retries):
+        try:
+            return await coro_factory()
+        except TelegramRetryAfter as exc:
+            wait_sec = min(exc.retry_after + 1.0, 30.0)
+            logger.warning("Telegram Flood Control: ожидание %.1f сек перед повтором...", wait_sec)
+            await asyncio.sleep(wait_sec)
+        except (TelegramNetworkError, TelegramServerError) as exc:
+            if attempt + 1 >= max_retries:
+                raise
+            wait_sec = 2.0 * (attempt + 1)
+            logger.warning(
+                "Сетевая ошибка Telegram API (%s), повтор %d/%d через %.1f сек...",
+                exc,
+                attempt + 1,
+                max_retries,
+                wait_sec,
+            )
+            await asyncio.sleep(wait_sec)
+    return None
 
 
 def setup_router(config: Config, downloader: YouTubeDownloader) -> Router:
@@ -37,7 +73,7 @@ def setup_router(config: Config, downloader: YouTubeDownloader) -> Router:
     @router.message(CommandStart())
     async def cmd_start(message: Message) -> None:
         if not is_user_allowed(message.from_user.id if message.from_user else None):
-            await message.answer("⛔ У вас нет доступа к этому боту.")
+            await _retry_telegram_call(lambda: message.answer("⛔ У вас нет доступа к этому боту."))
             return
 
         text = (
@@ -52,7 +88,7 @@ def setup_router(config: Config, downloader: YouTubeDownloader) -> Router:
             "/help — справка и лимиты\n"
             "/cancel — остановить текущую загрузку плейлиста"
         )
-        await message.answer(text, parse_mode=ParseMode.HTML)
+        await _retry_telegram_call(lambda: message.answer(text, parse_mode=ParseMode.HTML))
 
     @router.message(Command("help"))
     async def cmd_help(message: Message) -> None:
@@ -73,28 +109,117 @@ def setup_router(config: Config, downloader: YouTubeDownloader) -> Router:
             f"• Максимальная длительность одного видео: <code>{max_mins} мин</code>\n"
             f"• Максимальный размер MP3 файла: <code>{config.max_file_size_mb} МБ</code>"
         )
-        await message.answer(text, parse_mode=ParseMode.HTML)
+        await _retry_telegram_call(lambda: message.answer(text, parse_mode=ParseMode.HTML))
 
     @router.message(Command("cancel"))
     async def cmd_cancel(message: Message) -> None:
         if not message.from_user or not is_user_allowed(message.from_user.id):
             return
         cancelled_users.add(message.from_user.id)
-        await message.answer("🛑 Запрос на остановку принят. Текущая очередь скачивания прерывается.")
+        await _retry_telegram_call(
+            lambda: message.answer("🛑 Запрос на остановку принят. Текущая очередь скачивания прерывается.")
+        )
+
+    def _build_progress_text(
+        item_title: str,
+        state: ProgressState,
+        playlist_header: str = "",
+    ) -> str:
+        safe_title = html.escape(item_title)
+        header_block = f"{playlist_header}\n" if playlist_header else ""
+
+        if state.stage == "downloading":
+            bar = render_progress_bar(state.percent)
+            details: list[str] = []
+            if state.total_mb > 0:
+                details.append(f"{state.downloaded_mb:.1f} / {state.total_mb:.1f} МБ")
+            elif state.downloaded_mb > 0:
+                details.append(f"{state.downloaded_mb:.1f} МБ")
+            if state.speed_str:
+                details.append(state.speed_str)
+            if state.eta_str:
+                details.append(f"осталось {state.eta_str}")
+            details_line = f"\n📊 <code>{' • '.join(details)}</code>" if details else ""
+
+            return (
+                f"{header_block}"
+                f"🎬 <b>{safe_title}</b>\n\n"
+                f"📥 Скачивание аудиодорожки:\n"
+                f"<code>{bar}</code>{details_line}"
+            )
+
+        bar = render_progress_bar(100.0)
+        return (
+            f"{header_block}"
+            f"🎬 <b>{safe_title}</b>\n\n"
+            f"✅ Скачано: <code>{bar}</code>\n"
+            f"⚙️ <b>Конвертация видео в MP3 ({config.audio_bitrate} kbps)...</b>"
+        )
 
     async def send_single_track(
         message: Message,
         bot: Bot,
         item: VideoItem,
+        status_msg: Message | None = None,
+        playlist_header: str = "",
         prefix_label: str = "",
     ) -> bool:
-        """Скачивает одно видео в MP3 и отправляет пользователю с названием видео."""
+        """Скачивает одно видео в MP3, обновляя прогресс-бар, и отправляет пользователю."""
         track = None
-        try:
-            await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.RECORD_VOICE)
-            track = await downloader.download_mp3(item.webpage_url)
+        last_text = ""
+        last_edit_ts = 0.0
+        edit_lock = asyncio.Lock()
 
-            await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_VOICE)
+        async def on_progress(state: ProgressState) -> None:
+            nonlocal last_text, last_edit_ts
+            if status_msg is None:
+                return
+            if edit_lock.locked():
+                return
+            async with edit_lock:
+                now = time.monotonic()
+                if state.stage == "downloading" and (now - last_edit_ts) < 2.5:
+                    return
+                new_text = _build_progress_text(item.title, state, playlist_header=playlist_header)
+                if new_text == last_text:
+                    return
+                try:
+                    await status_msg.edit_text(new_text, parse_mode=ParseMode.HTML)
+                    last_text = new_text
+                    last_edit_ts = time.monotonic()
+                except TelegramRetryAfter as exc:
+                    last_edit_ts = time.monotonic() + exc.retry_after
+                except (TelegramBadRequest, TelegramNetworkError, TelegramServerError):
+                    pass
+                except Exception:
+                    pass
+
+        try:
+            try:
+                await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.RECORD_VOICE)
+            except Exception:
+                pass
+
+            track = await downloader.download_mp3(item.webpage_url, progress_callback=on_progress)
+
+            if status_msg is not None:
+                safe_title = html.escape(track.title)
+                header_block = f"{playlist_header}\n" if playlist_header else ""
+                upload_text = (
+                    f"{header_block}"
+                    f"🎵 <b>{safe_title}</b>\n\n"
+                    f"📤 <b>Отправка MP3 файла в Telegram...</b>"
+                )
+                if upload_text != last_text:
+                    try:
+                        await status_msg.edit_text(upload_text, parse_mode=ParseMode.HTML)
+                    except Exception:
+                        pass
+
+            try:
+                await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_VOICE)
+            except Exception:
+                pass
 
             audio_file = FSInputFile(
                 path=track.file_path,
@@ -113,30 +238,36 @@ def setup_router(config: Config, downloader: YouTubeDownloader) -> Router:
                 f"⏱ <code>{duration_str}</code>"
             )
 
-            await message.answer_audio(
-                audio=audio_file,
-                title=track.title,
-                performer=track.performer,
-                duration=track.duration,
-                thumbnail=thumb_file,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
+            await _retry_telegram_call(
+                lambda: message.answer_audio(
+                    audio=audio_file,
+                    title=track.title,
+                    performer=track.performer,
+                    duration=track.duration,
+                    thumbnail=thumb_file,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                )
             )
             return True
 
         except DownloadError as exc:
             safe_title = html.escape(item.title)
-            await message.answer(
-                f"⚠️ Не удалось обработать <b>{safe_title}</b>:\n<code>{html.escape(str(exc))}</code>",
-                parse_mode=ParseMode.HTML,
+            await _retry_telegram_call(
+                lambda: message.answer(
+                    f"⚠️ Не удалось обработать <b>{safe_title}</b>:\n<code>{html.escape(str(exc))}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
             )
             return False
         except Exception as exc:
             logger.exception("Непредвиденная ошибка при отправке трека %s", item.webpage_url)
             safe_title = html.escape(item.title)
-            await message.answer(
-                f"❌ Ошибка при отправке <b>{safe_title}</b>: <code>{html.escape(str(exc))}</code>",
-                parse_mode=ParseMode.HTML,
+            await _retry_telegram_call(
+                lambda: message.answer(
+                    f"❌ Ошибка при отправке <b>{safe_title}</b>: <code>{html.escape(str(exc))}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
             )
             return False
         finally:
@@ -153,7 +284,11 @@ def setup_router(config: Config, downloader: YouTubeDownloader) -> Router:
         user_id = message.from_user.id if message.from_user else 0
         cancelled_users.discard(user_id)
 
-        status_msg = await message.answer("🔍 Получаю информацию о ссылке...")
+        status_msg = await _retry_telegram_call(
+            lambda: message.answer("🔍 Получаю информацию о ссылке...")
+        )
+        if status_msg is None:
+            return
 
         try:
             source_info: MediaSourceInfo = await downloader.extract_source_info(
@@ -161,33 +296,45 @@ def setup_router(config: Config, downloader: YouTubeDownloader) -> Router:
                 allow_playlist=allow_playlist,
             )
         except DownloadError as exc:
-            await status_msg.edit_text(
-                f"❌ <b>Ошибка:</b>\n<code>{html.escape(str(exc))}</code>",
-                parse_mode=ParseMode.HTML,
-            )
+            try:
+                await status_msg.edit_text(
+                    f"❌ <b>Ошибка:</b>\n<code>{html.escape(str(exc))}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
             return
         except Exception as exc:
             logger.exception("Непредвиденная ошибка при анализе ссылки %s", url)
-            await status_msg.edit_text(
-                f"❌ <b>Не удалось обработать ссылку:</b>\n<code>{html.escape(str(exc))}</code>",
-                parse_mode=ParseMode.HTML,
-            )
+            try:
+                await status_msg.edit_text(
+                    f"❌ <b>Не удалось обработать ссылку:</b>\n<code>{html.escape(str(exc))}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
             return
 
         # Обработка одиночного видео
         if not source_info.is_playlist or len(source_info.items) == 1:
             item = source_info.items[0]
             safe_title = html.escape(item.title)
-            await status_msg.edit_text(
-                f"⏳ Скачиваю и конвертирую в MP3:\n🎬 <b>{safe_title}</b>",
-                parse_mode=ParseMode.HTML,
-            )
-            success = await send_single_track(message, bot, item)
-            if success:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
+            initial_bar = render_progress_bar(0.0)
+            try:
+                await status_msg.edit_text(
+                    f"🎬 <b>{safe_title}</b>\n\n"
+                    f"📥 Подготовка к скачиванию:\n"
+                    f"<code>{initial_bar}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+            await send_single_track(message, bot, item, status_msg=status_msg)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
             return
 
         # Обработка плейлиста
@@ -200,13 +347,16 @@ def setup_router(config: Config, downloader: YouTubeDownloader) -> Router:
                 f"будут скачаны первые {total_items} согласно лимиту)</i>"
             )
 
-        await status_msg.edit_text(
-            f"📂 <b>Плейлист:</b> {safe_playlist_title}\n"
-            f"🎶 Треков к загрузке: <b>{total_items}</b>{limit_note}\n\n"
-            "⏳ Начинаю поочерёдную конвертацию в MP3...\n"
-            "<i>Для остановки отправьте /cancel</i>",
-            parse_mode=ParseMode.HTML,
-        )
+        try:
+            await status_msg.edit_text(
+                f"📂 <b>Плейлист:</b> {safe_playlist_title}\n"
+                f"🎶 Треков к загрузке: <b>{total_items}</b>{limit_note}\n\n"
+                "⏳ Начинаю поочерёдную конвертацию в MP3...\n"
+                "<i>Для остановки отправьте /cancel</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
         success_count = 0
         fail_count = 0
@@ -214,27 +364,44 @@ def setup_router(config: Config, downloader: YouTubeDownloader) -> Router:
         for idx, item in enumerate(source_info.items, start=1):
             if user_id in cancelled_users:
                 cancelled_users.discard(user_id)
-                await message.answer(
-                    f"🛑 Загрузка плейлиста <b>{safe_playlist_title}</b> остановлена пользователем.\n"
-                    f"✅ Успешно загружено: <b>{success_count}</b> из {total_items}.",
-                    parse_mode=ParseMode.HTML,
+                await _retry_telegram_call(
+                    lambda: message.answer(
+                        f"🛑 Загрузка плейлиста <b>{safe_playlist_title}</b> остановлена пользователем.\n"
+                        f"✅ Успешно загружено: <b>{success_count}</b> из {total_items}.",
+                        parse_mode=ParseMode.HTML,
+                    )
                 )
                 return
 
+            playlist_bar = render_progress_bar(((idx - 1) / total_items) * 100.0, width=10)
+            playlist_header = (
+                f"📂 <b>Плейлист:</b> {safe_playlist_title}\n"
+                f"🗂 Прогресс плейлиста: <b>{idx}/{total_items}</b> <code>{playlist_bar}</code>\n"
+                f"<i>Для остановки отправьте /cancel</i>"
+            )
+
             safe_item_title = html.escape(item.title)
+            initial_track_bar = render_progress_bar(0.0)
             try:
                 await status_msg.edit_text(
-                    f"📂 <b>Плейлист:</b> {safe_playlist_title}\n"
-                    f"⏳ Скачиваю трек <b>{idx}/{total_items}</b>:\n"
-                    f"🎵 <b>{safe_item_title}</b>\n\n"
-                    "<i>Для остановки отправьте /cancel</i>",
+                    f"{playlist_header}\n\n"
+                    f"🎬 <b>{safe_item_title}</b>\n\n"
+                    f"📥 Подготовка к скачиванию:\n"
+                    f"<code>{initial_track_bar}</code>",
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
                 pass
 
             prefix = f"<code>[{idx}/{total_items}]</code> "
-            ok = await send_single_track(message, bot, item, prefix_label=prefix)
+            ok = await send_single_track(
+                message,
+                bot,
+                item,
+                status_msg=status_msg,
+                playlist_header=playlist_header,
+                prefix_label=prefix,
+            )
             if ok:
                 success_count += 1
             else:
@@ -253,7 +420,7 @@ def setup_router(config: Config, downloader: YouTubeDownloader) -> Router:
         try:
             await status_msg.edit_text(summary_text, parse_mode=ParseMode.HTML)
         except Exception:
-            await message.answer(summary_text, parse_mode=ParseMode.HTML)
+            await _retry_telegram_call(lambda: message.answer(summary_text, parse_mode=ParseMode.HTML))
 
     @router.callback_query(F.data.startswith("dl:"))
     async def handle_download_choice(callback: CallbackQuery, bot: Bot) -> None:
@@ -288,14 +455,16 @@ def setup_router(config: Config, downloader: YouTubeDownloader) -> Router:
     @router.message(F.text)
     async def handle_text_message(message: Message, bot: Bot) -> None:
         if not is_user_allowed(message.from_user.id if message.from_user else None):
-            await message.answer("⛔ У вас нет доступа к этому боту.")
+            await _retry_telegram_call(lambda: message.answer("⛔ У вас нет доступа к этому боту."))
             return
 
         urls = extract_youtube_urls(message.text or "")
         if not urls:
-            await message.answer(
-                "🔗 Пожалуйста, отправьте корректную ссылку на видео или плейлист <b>YouTube</b>.",
-                parse_mode=ParseMode.HTML,
+            await _retry_telegram_call(
+                lambda: message.answer(
+                    "🔗 Пожалуйста, отправьте корректную ссылку на видео или плейлист <b>YouTube</b>.",
+                    parse_mode=ParseMode.HTML,
+                )
             )
             return
 
@@ -324,9 +493,11 @@ def setup_router(config: Config, downloader: YouTubeDownloader) -> Router:
                         ]
                     ]
                 )
-                await message.answer(
-                    "🤔 Эта ссылка ведёт на видео внутри плейлиста. Что именно скачать?",
-                    reply_markup=keyboard,
+                await _retry_telegram_call(
+                    lambda: message.answer(
+                        "🤔 Эта ссылка ведёт на видео внутри плейлиста. Что именно скачать?",
+                        reply_markup=keyboard,
+                    )
                 )
             else:
                 await process_url(

@@ -1,8 +1,10 @@
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import logging
 from pathlib import Path
 import shutil
+import time
 import uuid
 from typing import Any
 
@@ -12,6 +14,20 @@ from bot.config import Config
 from bot.utils import sanitize_filename
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ProgressState:
+    """Текущее состояние прогресса скачивания или конвертации."""
+    stage: str  # "downloading" | "converting"
+    percent: float
+    downloaded_mb: float = 0.0
+    total_mb: float = 0.0
+    speed_str: str = ""
+    eta_str: str = ""
+
+
+ProgressCallback = Callable[[ProgressState], Awaitable[None]]
 
 
 @dataclass
@@ -64,15 +80,57 @@ class YouTubeDownloader:
         self.config = config
         self._semaphore = asyncio.Semaphore(config.max_concurrent_downloads)
 
+    def cleanup_all_downloads(self) -> None:
+        """Полная очистка папки загрузок при старте бота."""
+        if not self.config.download_dir.exists():
+            return
+        removed = 0
+        for item in self.config.download_dir.iterdir():
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink(missing_ok=True)
+                removed += 1
+            except Exception as exc:
+                logger.warning("Не удалось удалить старый временный файл %s: %s", item, exc)
+        if removed > 0:
+            logger.info("Очищено старых временных папок/файлов при запуске: %d", removed)
+
+    def cleanup_stale_files(self, max_age_seconds: int = 1800) -> int:
+        """Удаляет зависшие временные директории и файлы старше max_age_seconds (по умолчанию 30 минут)."""
+        if not self.config.download_dir.exists():
+            return 0
+        now = time.time()
+        removed = 0
+        for item in self.config.download_dir.iterdir():
+            try:
+                mtime = item.stat().st_mtime
+                if now - mtime > max_age_seconds:
+                    if item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+                    else:
+                        item.unlink(missing_ok=True)
+                    removed += 1
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                logger.warning("Ошибка при проверке/удалении %s: %s", item, exc)
+        if removed > 0:
+            logger.info("Периодическая очистка: удалено %d устаревших временных папок/файлов.", removed)
+        return removed
+
     def _base_ydl_opts(self) -> dict[str, Any]:
         opts: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
+            "noprogress": True,
             "nocheckcertificate": True,
             "geo_bypass": True,
             "socket_timeout": 30,
             "retries": 3,
             "fragment_retries": 3,
+            "cachedir": False,
             "extractor_args": {
                 "youtube": {
                     "player_client": ["android", "web"],
@@ -191,17 +249,109 @@ class YouTubeDownloader:
             total_playlist_count=1,
         )
 
-    async def download_mp3(self, video_url: str) -> DownloadedTrack:
+    async def download_mp3(
+        self,
+        video_url: str,
+        progress_callback: ProgressCallback | None = None,
+    ) -> DownloadedTrack:
         """
         Скачивает аудиодорожку видео, конвертирует в MP3 через FFmpeg и переименовывает
         файл строго по названию видеоролика.
         """
+        loop = asyncio.get_running_loop()
         async with self._semaphore:
-            return await asyncio.to_thread(self._download_mp3_sync, video_url)
+            return await asyncio.to_thread(
+                self._download_mp3_sync,
+                video_url,
+                loop,
+                progress_callback,
+            )
 
-    def _download_mp3_sync(self, video_url: str) -> DownloadedTrack:
+    def _download_mp3_sync(
+        self,
+        video_url: str,
+        loop: asyncio.AbstractEventLoop | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> DownloadedTrack:
         task_dir = self.config.download_dir / uuid.uuid4().hex
         task_dir.mkdir(parents=True, exist_ok=True)
+
+        last_update_time = 0.0
+        last_reported_stage = ""
+
+        def _emit_progress(state: ProgressState, *, force: bool = False) -> None:
+            nonlocal last_update_time, last_reported_stage
+            if not progress_callback or not loop:
+                return
+            now = time.monotonic()
+            if not force and state.stage == last_reported_stage and (now - last_update_time) < 2.0:
+                return
+            last_update_time = now
+            last_reported_stage = state.stage
+            try:
+                asyncio.run_coroutine_threadsafe(progress_callback(state), loop)
+            except Exception:
+                pass
+
+        def _progress_hook(d: dict[str, Any]) -> None:
+            status = d.get("status")
+            if status == "downloading":
+                downloaded = d.get("downloaded_bytes") or 0
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                if total > 0:
+                    percent = min(99.0, (downloaded / total) * 100.0)
+                else:
+                    percent = 0.0
+
+                speed = d.get("speed")
+                if speed and speed > 0:
+                    if speed >= 1024 * 1024:
+                        speed_str = f"{speed / (1024 * 1024):.1f} МБ/с"
+                    else:
+                        speed_str = f"{speed / 1024:.0f} КБ/с"
+                else:
+                    speed_str = ""
+
+                eta = d.get("eta")
+                if isinstance(eta, (int, float)) and eta >= 0:
+                    mins, secs = divmod(int(eta), 60)
+                    eta_str = f"{mins:02d}:{secs:02d}"
+                else:
+                    eta_str = ""
+
+                _emit_progress(
+                    ProgressState(
+                        stage="downloading",
+                        percent=percent,
+                        downloaded_mb=downloaded / (1024 * 1024),
+                        total_mb=total / (1024 * 1024) if total else 0.0,
+                        speed_str=speed_str,
+                        eta_str=eta_str,
+                    )
+                )
+            elif status == "finished":
+                total = d.get("total_bytes") or d.get("downloaded_bytes") or 0
+                total_mb = total / (1024 * 1024) if total else 0.0
+                _emit_progress(
+                    ProgressState(
+                        stage="converting",
+                        percent=100.0,
+                        downloaded_mb=total_mb,
+                        total_mb=total_mb,
+                    ),
+                    force=True,
+                )
+
+        def _postprocessor_hook(d: dict[str, Any]) -> None:
+            status = d.get("status")
+            if status == "started":
+                _emit_progress(
+                    ProgressState(
+                        stage="converting",
+                        percent=100.0,
+                    ),
+                    force=True,
+                )
 
         try:
             # Шаг 1: Проверяем длительность до начала скачивания
@@ -235,6 +385,9 @@ class YouTubeDownloader:
                     "noplaylist": True,
                     "outtmpl": outtmpl,
                     "writethumbnail": True,
+                    "keepvideo": False,
+                    "progress_hooks": [_progress_hook],
+                    "postprocessor_hooks": [_postprocessor_hook],
                     "postprocessors": [
                         {
                             "key": "FFmpegExtractAudio",
@@ -290,6 +443,14 @@ class YouTubeDownloader:
             # Ищем сконвертированную обложку .jpg, если она скачалась
             jpg_files = list(task_dir.glob("*.jpg"))
             thumbnail_path = jpg_files[0] if jpg_files else None
+
+            # Удаляем все прочие промежуточные файлы (.webm, .m4a, .webp, .part), если они остались
+            keep_files = {final_mp3_path}
+            if thumbnail_path:
+                keep_files.add(thumbnail_path)
+            for f in task_dir.iterdir():
+                if f not in keep_files and f.is_file():
+                    f.unlink(missing_ok=True)
 
             return DownloadedTrack(
                 file_path=final_mp3_path,
