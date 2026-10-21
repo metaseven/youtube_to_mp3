@@ -284,7 +284,7 @@ class YouTubeDownloader:
             if not progress_callback or not loop:
                 return
             now = time.monotonic()
-            if not force and state.stage == last_reported_stage and (now - last_update_time) < 2.0:
+            if not force and state.stage == last_reported_stage and (now - last_update_time) < 1.2:
                 return
             last_update_time = now
             last_reported_stage = state.stage

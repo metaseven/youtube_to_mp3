@@ -178,7 +178,7 @@ def setup_router(config: Config, downloader: YouTubeDownloader) -> Router:
                 return
             async with edit_lock:
                 now = time.monotonic()
-                if state.stage == "downloading" and (now - last_edit_ts) < 2.5:
+                if state.stage == "downloading" and (now - last_edit_ts) < 1.5:
                     return
                 new_text = _build_progress_text(item.title, state, playlist_header=playlist_header)
                 if new_text == last_text:
